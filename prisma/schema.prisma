@@ -1,0 +1,69 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+model Profile {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  fullName  String?  @map("full_name")
+  avatarUrl String?  @map("avatar_url")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  workspaces Workspace[]
+
+  @@map("profiles")
+}
+
+model Workspace {
+  id        String   @id @default(uuid())
+  name      String
+  ownerId   String   @map("owner_id")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  owner     Profile  @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  videos    Video[]
+
+  @@map("workspaces")
+}
+
+model Video {
+  id            String   @id @default(uuid())
+  workspaceId   String   @map("workspace_id")
+  title         String
+  originalUrl   String   @map("original_url")
+  status        String   @default("pending") // pending, processing, completed, error
+  duration      Int?     // segundos
+  thumbnailUrl  String?  @map("thumbnail_url")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  workspace     Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  cortes        Corte[]
+
+  @@map("videos")
+}
+
+model Corte {
+  id          String   @id @default(uuid())
+  videoId     String   @map("video_id")
+  title       String
+  caption     String?
+  storagePath String   @map("storage_path")
+  videoUrl    String   @map("video_url")
+  thumbnailUrl String? @map("thumbnail_url")
+  viralScore  Int?     @map("viral_score")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  video       Video    @relation(fields: [videoId], references: [id], onDelete: Cascade)
+
+  @@map("cortes")
+}
