@@ -38,10 +38,26 @@ export async function getPresignedUploadUrl(
     return {
       uploadUrl: signedUrl,
       fileKey: uniqueFileName,
-      publicUrl: `${process.env.R2_PUBLIC_URL}/${uniqueFileName}`, // Optional: if you have a public domain mapped
+      publicUrl: process.env.R2_PUBLIC_URL ? `${process.env.R2_PUBLIC_URL}/${uniqueFileName}` : null,
     };
   } catch (error) {
     console.error("Error generating presigned URL:", error);
     throw error;
+  }
+}
+
+export async function getPresignedDownloadUrl(fileKey: string) {
+  const { GetObjectCommand } = await import("@aws-sdk/client-s3");
+  const command = new GetObjectCommand({
+    Bucket: R2_BUCKET_NAME,
+    Key: fileKey,
+  });
+
+  try {
+    const signedUrl = await getSignedUrl(r2, command, { expiresIn: 3600 });
+    return signedUrl;
+  } catch (error) {
+    console.error("Error generating presigned download URL:", error);
+    return null;
   }
 }

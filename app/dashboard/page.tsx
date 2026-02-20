@@ -51,12 +51,13 @@ import {
   ExternalLink,
 } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
-import { mockStats, mockHistorico, mockCortes } from "@/lib/mock-data";
 import {
   createVideoRecord,
   getDashboardStats,
   getRecentActivity,
+  getRecentCuts,
   getUploadUrl,
+  getVideoStatus,
 } from "./actions";
 
 // ... previous imports
@@ -81,6 +82,7 @@ export default function DashboardPage() {
     taxa: 0,
   });
   const [activity, setActivity] = useState<any[]>([]);
+  const [recentCuts, setRecentCuts] = useState<any[]>([]);
   const [loadingData, setLoadingData] = useState(true);
 
   const [advancedOpen, setAdvancedOpen] = useState(false);
@@ -94,15 +96,18 @@ export default function DashboardPage() {
   useEffect(() => {
     async function loadDashboardData() {
       try {
-        const [statsData, activityData] = await Promise.all([
+        const [statsData, activityData, cutsData] = await Promise.all([
           getDashboardStats(),
           getRecentActivity(),
+          getRecentCuts(),
         ]);
         setStats(statsData as any);
         setActivity(activityData);
+        setRecentCuts(cutsData);
       } catch (error) {
         console.error("Failed to load dashboard data", error);
         toast.error("Erro ao carregar dados do dashboard.");
+        // Fallback to mocks if fail? keeping empty for now
       } finally {
         setLoadingData(false);
       }
@@ -144,7 +149,7 @@ export default function DashboardPage() {
           throw new Error("Falha no upload para o R2");
         }
 
-        finalVideoUrl = uploadConfig.publicUrl || "";
+        finalVideoUrl = uploadConfig.publicUrl || uploadConfig.fileKey || "";
         setPipelineStep(1);
       }
 
@@ -157,22 +162,72 @@ export default function DashboardPage() {
       formData.append("originalUrl", finalVideoUrl);
       // formData.append("duration", "0"); // Can't get easily without metadata parsing
 
+      formData.append("generateSubtitles", String(generateSubtitles));
+      formData.append("videoLanguage", videoLanguage);
+      formData.append("cutStyle", cutStyle);
+
       const result = await createVideoRecord(formData);
       if (result.error) throw new Error(result.error);
 
       setPipelineStep(2);
+      toast.success("Vídeo enviado! Acompanhe o progresso.");
+      setDialogOpen(false);
 
-      // 3. Simulate remaining pipeline
-      setTimeout(() => setPipelineStep(3), 1500);
-      setTimeout(() => {
+      // 3. Real status polling
+      const videoId = result.videoId;
+      if (videoId) {
+        const pollStatus = async () => {
+          const maxAttempts = 120; // ~10 minutos
+          for (let i = 0; i < maxAttempts; i++) {
+            await new Promise((r) => setTimeout(r, 5000));
+            try {
+              const status = await getVideoStatus(videoId);
+              if (!status) continue;
+              
+              if (status.status === "processing") {
+                setPipelineStep(2); // Análise IA
+              }
+
+              if (status.status === "rendering") {
+                setPipelineStep(3); // Renderização FFmpeg
+              }
+              
+              if (status.status === "completed" || status.status === "archived") {
+                setPipelineStep(4); // Finalizado
+                toast.success(
+                  `${status.cortesCount} cortes gerados com sucesso!`,
+                );
+                // Refresh data
+                getDashboardStats().then(setStats as any);
+                getRecentActivity().then(setActivity);
+                getRecentCuts().then(setRecentCuts);
+                setTimeout(() => {
+                  setPipelineStep(-1);
+                  setIsProcessing(false);
+                }, 2000);
+                return;
+              }
+              
+              if (status.status === "error") {
+                toast.error("Erro no processamento do vídeo.");
+                setPipelineStep(-1);
+                setIsProcessing(false);
+                return;
+              }
+            } catch (e) {
+              console.error("Polling error:", e);
+            }
+          }
+          // Timeout
+          toast.info("Processamento está demorando. Verifique o histórico.");
+          setPipelineStep(-1);
+          setIsProcessing(false);
+        };
+        pollStatus();
+      } else {
         setPipelineStep(-1);
         setIsProcessing(false);
-        setDialogOpen(false);
-        toast.success("Vídeo enviado para processamento!");
-        // Refresh data
-        getDashboardStats().then(setStats as any);
-        getRecentActivity().then(setActivity);
-      }, 3000);
+      }
     } catch (error: any) {
       console.error(error);
       toast.error(error.message || "Erro ao processar vídeo");
@@ -408,7 +463,13 @@ export default function DashboardPage() {
             </CardHeader>
             <CardContent>
               <div className="space-y-3">
-                {mockHistorico.map((item) => (
+                {activity.length === 0 ? (
+                    <div className="flex flex-col items-center justify-center py-8 text-center text-muted-foreground">
+                        <History className="h-8 w-8 mb-2 opacity-50" />
+                        <p>Nenhuma atividade recente</p>
+                    </div>
+                ) : (
+                    activity.map((item) => (
                   <div
                     key={item.id}
                     className="flex items-center gap-3 rounded-lg border p-3 transition-colors hover:bg-muted/50"
@@ -457,7 +518,8 @@ export default function DashboardPage() {
                       </Badge>
                     )}
                   </div>
-                ))}
+                ))
+              )}
               </div>
             </CardContent>
           </Card>
@@ -479,7 +541,7 @@ export default function DashboardPage() {
                   className="gap-1 text-xs"
                   asChild
                 >
-                  <Link href="/dashboard/cortes/vid-001">
+                  <Link href="/dashboard/historico">
                     Ver todos
                     <ArrowRight className="h-3 w-3" />
                   </Link>
@@ -487,14 +549,39 @@ export default function DashboardPage() {
               </div>
             </CardHeader>
             <CardContent>
-              <div className="grid grid-cols-2 gap-3">
-                {mockCortes.slice(0, 4).map((corte) => (
-                  <div
+              {recentCuts.length === 0 ? (
+                  <div className="flex flex-col items-center justify-center py-12 text-center text-muted-foreground">
+                      <Scissors className="h-10 w-10 mb-3 opacity-20" />
+                      <p>Nenhum corte gerado ainda</p>
+                      <p className="text-xs mt-1">Envie um vídeo para começar!</p>
+                  </div>
+              ) : (
+                  <div className="grid grid-cols-2 gap-3">
+                    {recentCuts.slice(0, 2).map((corte: any) => (
+                  <Link
                     key={corte.id}
+                    href={`/dashboard/cortes/${corte.videoId}`}
                     className="group cursor-pointer overflow-hidden rounded-lg border transition-all hover:border-primary/30 hover:shadow-md"
                   >
-                    <div className="relative aspect-[9/14] bg-gradient-to-br from-muted to-muted/30">
-                      <div className="absolute inset-0 flex items-center justify-center opacity-0 transition-opacity group-hover:opacity-100">
+                    <div className="relative aspect-[9/16] bg-black">
+                      {corte.videoUrl ? (
+                        <video 
+                          src={corte.videoUrl} 
+                          className="h-full w-full object-cover opacity-80 group-hover:opacity-100 transition-opacity" 
+                          muted 
+                          onMouseOver={(e) => (e.target as HTMLVideoElement).play()}
+                          onMouseOut={(e) => {
+                            (e.target as HTMLVideoElement).pause();
+                            (e.target as HTMLVideoElement).currentTime = 0;
+                          }}
+                        />
+                      ) : (
+                        <div className="absolute inset-0 flex items-center justify-center bg-gradient-to-br from-muted to-muted/30">
+                           <Scissors className="h-8 w-8 opacity-20" />
+                        </div>
+                      )}
+                      
+                      <div className="absolute inset-0 flex items-center justify-center opacity-0 transition-opacity group-hover:opacity-100 bg-black/20 pointer-events-none">
                         <div className="flex h-10 w-10 items-center justify-center rounded-full bg-primary/90 text-primary-foreground shadow-lg">
                           <Play className="ml-0.5 h-4 w-4" />
                         </div>
@@ -513,22 +600,23 @@ export default function DashboardPage() {
                         {corte.titulo}
                       </p>
                       <div className="mt-1 flex gap-1">
-                        {corte.tags.slice(0, 2).map((tag) => (
+                        {corte.tags.slice(0, 2).map((tag: string) => (
                           <span key={tag} className="text-[10px] text-primary">
                             {tag}
                           </span>
                         ))}
                       </div>
                     </div>
-                  </div>
+                  </Link>
                 ))}
               </div>
+            )}
             </CardContent>
           </Card>
 
           {/* Card de dicas */}
           <Card className="border-primary/20 bg-gradient-to-br from-primary/5 to-transparent">
-            <CardContent className="p-5">
+            <CardContent className="p-8">
               <div className="flex items-start gap-3">
                 <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary">
                   <Sparkles className="h-5 w-5" />

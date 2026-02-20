@@ -12,6 +12,9 @@ export async function createVideoRecord(formData: FormData) {
     ? parseInt(formData.get("duration") as string)
     : 0;
   const workspaceId = formData.get("workspaceId") as string;
+  const generateSubtitles = formData.get("generateSubtitles") === "true";
+  const videoLanguage = (formData.get("videoLanguage") as string) || "auto";
+  const cutStyle = (formData.get("cutStyle") as string) || "fill";
 
   // Validate session
   const {
@@ -55,7 +58,8 @@ export async function createVideoRecord(formData: FormData) {
       title: title,
       original_url: originalUrl,
       duration: duration,
-      status: "pending", // Initial status
+      style: cutStyle,
+      status: "pending",
     })
     .select()
     .single();
@@ -65,31 +69,67 @@ export async function createVideoRecord(formData: FormData) {
     return { error: "Failed to save video metadata." };
   }
 
-  // SIMULATION: In a real app, this would happen in a background job queue (e.g., BullMQ)
-  // Here we simulate the "processed" state and send the email immediately for demonstration
-  // In production: triggerCloudFunction(data.id) -> Cloud Function updates DB -> triggers Email
+  // Trigger n8n Webhook
+  const n8nWebhookUrl = process.env.N8N_WEBHOOK_URL;
+  if (n8nWebhookUrl) {
+    try {
+      // Generate Presigned Download URL for n8n
+      const { getPresignedDownloadUrl } = await import("@/lib/r2");
+      let videoUrlForN8n = originalUrl;
+      
+      // If originalUrl is not a full URL (meaning it's a key) or if we want to ensure access
+      // We try to generate a signed URL. 
+      // Assuming originalUrl stored in DB might be the key or the public URL. 
+      // The component sends 'publicUrl' from r2.ts as 'originalUrl'.
+      // If R2_PUBLIC_URL was empty, originalUrl might be just the key or null/undefined.
+      
+      // Let's verify what we actually have. The getUploadUrl returns fileKey.
+      // We should probably rely on re-generating the signed url using the key.
+      // But we don't have the bare key easily unless we extract it or pass it.
+      // Simplified approach: unexpected publicUrl? Try to treat the filename as key if possible.
+      // BETTER: The component should send the fileKey too.
+      // For now, let's assume originalUrl IS the key if it doesn't start with http, OR we extract last part.
+      
+      const fileKey = originalUrl.split("/").pop(); 
+      if (fileKey) {
+          const signedUrl = await getPresignedDownloadUrl(fileKey);
+          if (signedUrl) {
+              videoUrlForN8n = signedUrl;
+          }
+      }
 
-  import("@/lib/mail")
-    .then(async ({ sendEmail }) => {
-      import("@/lib/email-templates").then(
-        async ({ getVideoProcessedEmail }) => {
-          const emailHtml = getVideoProcessedEmail(
-            user.user_metadata.full_name || "Usuário",
-            title,
-            process.env.NEXT_PUBLIC_APP_URL + "/dashboard",
-          );
-          await sendEmail({
-            to: user.email!,
-            subject: "Seu vídeo foi processado! ✂️",
-            html: emailHtml,
-          });
+      const payload = {
+          videoId: data.id,
+          userId: user.id,
+          videoUrl: videoUrlForN8n,
+          title: title,
+          options: {
+            style: cutStyle,
+            language: videoLanguage,
+            subtitles: generateSubtitles,
+          },
+      };
+      
+      console.log("Sending payload to n8n:", JSON.stringify(payload, null, 2));
+
+      const response = await fetch(n8nWebhookUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
         },
-      );
-    })
-    .catch((err) => console.error("Failed to send simulation email", err));
+        body: JSON.stringify(payload),
+      });
+      console.log("n8n webhook triggered. Status:", response.status, "for video:", data.id);
+      if (!response.ok) {
+        console.error("n8n response error:", await response.text());
+      }
+    } catch (err) {
+      console.error("Failed to trigger n8n webhook:", err);
+    }
+  }
 
   revalidatePath("/dashboard");
-  return { success: true, data };
+  return { success: true, data, videoId: data.id };
 }
 
 export async function getDashboardStats() {
@@ -109,7 +149,7 @@ export async function getDashboardStats() {
   if (!workspaces || workspaces.length === 0)
     return { videos: 0, cortes: 0, taxa: 0 };
 
-  const workspaceIds = workspaces.map((w) => w.id);
+  const workspaceIds = workspaces.map((w: { id: string }) => w.id);
 
   // Count Videos
   const { count: videosCount } = await supabase
@@ -156,14 +196,167 @@ export async function getRecentActivity() {
     .limit(5);
 
   return (
-    videos?.map((v) => ({
+    videos?.map((v: any) => ({
       id: v.id,
       nome: v.title,
-      status: v.status === "completed" ? "concluido" : "aguardando", // Map DB status to UI status
+      status: (v.status === "completed" || v.status === "archived") ? "concluido" : "aguardando", // Map DB status to UI status
       data: new Date(v.created_at).toLocaleDateString("pt-BR"),
       cortesCount: v.cortes?.[0]?.count || 0, // Approximate join count
     })) || []
   );
+}
+
+export async function getRecentCuts(limit: number = 6) {
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
+  if (!user) return [];
+
+  const { data: cortes } = await supabase
+    .from("cortes")
+    .select(`
+        id,
+        title,
+        caption,
+        viral_score,
+        start_time,
+        end_time,
+        created_at,
+        storage_path,
+        thumbnail_url,
+        video_id,
+        video:videos (title)
+    `)
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  return Promise.all((cortes || []).map(async (c: any) => {
+      let videoUrl = null;
+      if (c.storage_path) {
+        try {
+          const { getPresignedDownloadUrl } = await import("@/lib/r2");
+          videoUrl = await getPresignedDownloadUrl(c.storage_path);
+        } catch (e) {
+          console.error("Error signing recent cut", e);
+        }
+      }
+
+      return {
+        id: c.id,
+        videoId: c.video_id,
+        titulo: c.title,
+        legenda: c.caption,
+        tags: ["#Viral", `#${c.viral_score || 0}pts`], 
+        duracao: calculateDuration(c.start_time, c.end_time),
+        thumbnail: c.thumbnail_url,
+        videoUrl: videoUrl,
+        videoTitle: c.video?.title
+      };
+  }));
+}
+
+export async function getCutsForVideo(videoId: string) {
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
+  if (!user) return [];
+
+  const { data: cortes } = await supabase
+    .from("cortes")
+    .select(`
+        id,
+        title,
+        caption,
+        viral_score,
+        start_time,
+        end_time,
+        created_at,
+        storage_path,
+        thumbnail_url
+    `)
+    .eq("video_id", videoId)
+    .order("created_at", { ascending: false });
+
+  // Fetch parent video to get the key
+  const { data: video } = await supabase
+    .from("videos")
+    .select("original_url")
+    .eq("id", videoId)
+    .single();
+
+  let signedVideoUrl = null;
+  if (video?.original_url) {
+      let fileKey = video.original_url;
+      
+      // Extract just the filename from any URL or path format
+      // Handle cases like "placeholder text/timestamp-file.mp4" or full URLs
+      const lastSlash = fileKey.lastIndexOf("/");
+      if (lastSlash >= 0) {
+        fileKey = fileKey.substring(lastSlash + 1);
+      }
+      // Remove query params
+      if (fileKey.includes("?")) {
+        fileKey = fileKey.split("?")[0];
+      }
+      // Decode URI
+      fileKey = decodeURIComponent(fileKey);
+
+      console.log(`Generating signed URL for key: ${fileKey}`);
+      
+      try {
+        const { getPresignedDownloadUrl } = await import("@/lib/r2");
+        signedVideoUrl = await getPresignedDownloadUrl(fileKey);
+      } catch (e) {
+          console.error("Failed to generate signed url for video", e);
+      }
+  }
+
+  // Parallel processing for cuts
+  const processedCuts = await Promise.all((cortes || []).map(async (c: any) => {
+      let cutVideoUrl = signedVideoUrl; // Default to parent (Virtual)
+      const isProcessed = !!(c.storage_path && c.storage_path.length > 0);
+      
+      if (isProcessed) {
+          // If processed, fetching the specific cut URL override
+          try {
+             // We can import dynamically or reuse existing r2 logic
+             // Ideally we shouldn't await in loop, but for <50 items it's okay given R2 signing is fast local-only op (if just signing)
+             // Actually, getPresignedDownloadUrl IS local crypto op, no network.
+             const { getPresignedDownloadUrl } = await import("@/lib/r2");
+             const signedCut = await getPresignedDownloadUrl(c.storage_path);
+             if (signedCut) cutVideoUrl = signedCut;
+          } catch (e) {
+             console.error("Error signing cut url", e);
+          }
+      }
+
+      return {
+        id: c.id,
+        videoId: videoId,
+        titulo: c.title,
+        legenda: c.caption,
+        tags: ["#Viral", `#${c.viral_score || 0}pts`], 
+        duracao: calculateDuration(c.start_time, c.end_time),
+        startTime: c.start_time || "00:00:00",
+        endTime: c.end_time || "00:00:10",
+        thumbnail: c.thumbnail_url,
+        videoUrl: cutVideoUrl,
+        isProcessed: isProcessed
+      };
+  }));
+
+  return processedCuts;
+}
+
+function calculateDuration(start: string | null, end: string | null) {
+    if (!start || !end) return "00:00";
+    // Simple calc if format is HH:MM:SS or MM:SS
+    // Basic return logic for display
+    return `${start} - ${end}`; 
 }
 
 export async function getUploadUrl(fileName: string, fileType: string) {
@@ -178,4 +371,133 @@ export async function getUploadUrl(fileName: string, fileType: string) {
     console.error("Error generating upload URL:", error);
     return { error: "Failed to generate upload URL" };
   }
+}
+
+// ========== VIDEO HISTORY ==========
+
+export async function getVideoHistory() {
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return [];
+
+  const { data: videos } = await supabase
+    .from("videos")
+    .select(`
+        id,
+        title,
+        status,
+        created_at,
+        cortes (id)
+    `)
+    .order("created_at", { ascending: false });
+
+  return (videos || []).map((v: any) => ({
+    id: v.id,
+    nome: v.title,
+    data: new Date(v.created_at).toLocaleDateString("pt-BR", {
+        day: "numeric", month: "long", hour: "2-digit", minute: "2-digit"
+    }),
+    status: mapStatus(v.status),
+    cortesCount: v.cortes?.length || 0,
+  }));
+}
+
+function mapStatus(dbStatus: string): "concluido" | "aguardando" | "erro" {
+  switch (dbStatus) {
+    case "completed": case "archived": return "concluido";
+    case "error": return "erro";
+    default: return "aguardando"; // pending, processing
+  }
+}
+
+// ========== VIDEO STATUS POLLING ==========
+
+export async function getVideoStatus(videoId: string) {
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return null;
+
+  const { data: video } = await supabase
+    .from("videos")
+    .select("id, status, title, created_at")
+    .eq("id", videoId)
+    .single();
+
+  if (!video) return null;
+
+  const { count } = await supabase
+    .from("cortes")
+    .select("id", { count: "exact", head: true })
+    .eq("video_id", videoId);
+
+  return {
+    id: video.id,
+    status: video.status,
+    title: video.title,
+    cortesCount: count || 0,
+  };
+}
+
+// ========== CRUD: DELETE VIDEO ==========
+
+export async function deleteVideo(videoId: string) {
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return { error: "Unauthorized" };
+
+  try {
+    const prisma = (await import("@/lib/db")).default;
+    await prisma.video.delete({ where: { id: videoId } });
+  } catch (error) {
+    console.error("Error deleting video:", error);
+    return { error: "Failed to delete video" };
+  }
+
+  revalidatePath("/dashboard");
+  revalidatePath("/dashboard/historico");
+  return { success: true };
+}
+
+// ========== CRUD: DELETE CORTE ==========
+
+export async function deleteCorte(corteId: string) {
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return { error: "Unauthorized" };
+
+  try {
+    const prisma = (await import("@/lib/db")).default;
+    await prisma.corte.delete({ where: { id: corteId } });
+  } catch (error) {
+    console.error("Error deleting corte:", error);
+    return { error: "Failed to delete corte" };
+  }
+
+  revalidatePath("/dashboard");
+  return { success: true };
+}
+
+// ========== CRUD: UPDATE CORTE ==========
+
+export async function updateCorte(corteId: string, data: { title?: string; caption?: string }) {
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return { error: "Unauthorized" };
+
+  try {
+    const prisma = (await import("@/lib/db")).default;
+    await prisma.corte.update({
+      where: { id: corteId },
+      data: {
+        ...(data.title !== undefined && { title: data.title }),
+        ...(data.caption !== undefined && { caption: data.caption }),
+      },
+    });
+  } catch (error) {
+    console.error("Error updating corte:", error);
+    return { error: "Failed to update corte" };
+  }
+
+  revalidatePath("/dashboard");
+  return { success: true };
 }

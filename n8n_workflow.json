@@ -1,0 +1,215 @@
+{
+  "name": "CortexAI - Video Processor",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "cortex-trigger",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "webhook-trigger",
+      "name": "Webhook"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.deepgram.com/v1/listen",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "model",
+              "value": "nova-2"
+            },
+            {
+              "name": "smart_format",
+              "value": "true"
+            },
+            {
+              "name": "language",
+              "value": "={{ $json.body.options.language === 'auto' ? 'pt' : $json.body.options.language }}"
+            },
+            {
+              "name": "utterances",
+              "value": "true"
+            },
+            {
+              "name": "punctuate",
+              "value": "true"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Token 707765416facb34cea2a3461a1b70bb39f7a9a1f"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "url",
+              "value": "={{ $json.body.videoUrl }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [
+        250,
+        0
+      ],
+      "id": "deepgram-http",
+      "name": "Deepgram API (URL)"
+    },
+    {
+      "parameters": {
+        "jsCode": "const words = items[0].json.results.channels[0].alternatives[0].words;\nconst transcript = items[0].json.results.channels[0].alternatives[0].transcript;\n\nconst prompt = `Você é um editor de vídeo especialista em viralização (TikTok/Reels/Shorts).\nAnalise a transcrição abaixo (com timestamps por palavra) e identifique 3 a 5 momentos com alto potencial viral.\nCritérios: Humor, Curiosidade, Polêmica ou Ensinamento Rápido.\nDuração: Entre 30s e 60s.\n\nIMPORTANTE: Para cada corte, inclua o array 'words' contendo TODAS as palavras daquele trecho exato com seus timestamps (start/end em segundos).\n\nRetorne APENAS um JSON válido no formato:\n[{\"start\": \"00:00:10\", \"end\": \"00:00:55\", \"title\": \"TÍTULO VIRAL EM CAPS\", \"summary\": \"Legenda do post\", \"viralScore\": 95, \"words\": [{\"word\": \"exemplo\", \"start\": 10.0, \"end\": 10.3}]}]\n\nTranscrição com timestamps:\n${JSON.stringify(words)}`;\n\nreturn [{ \n  json: { \n    prompt, \n    videoId: $node[\"Webhook\"].json.body.videoId \n  } \n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [
+        500,
+        0
+      ],
+      "id": "prepare-prompt",
+      "name": "Prepare Prompt"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "key",
+              "value": "AIzaSyCO6-V0vqTY9Pid2I36XsMEtt44kI4fl5o"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "contents",
+              "value": "={{ [ { \"parts\": [ { \"text\": $json.prompt } ] } ] }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [
+        750,
+        0
+      ],
+      "id": "gemini-http",
+      "name": "Gemini API"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:3000/api/webhooks/n8n",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "videoId",
+              "value": "={{ $node[\"Prepare Prompt\"].json.videoId }}"
+            },
+            {
+              "name": "status",
+              "value": "completed"
+            },
+            {
+              "name": "cortes",
+              "value": "={{ $json.candidates[0].content.parts[0].text.replace(/```json/g, '').replace(/```/g, '') }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [
+        1000,
+        0
+      ],
+      "id": "callback-api",
+      "name": "Callback API"
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Deepgram API (URL)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Deepgram API (URL)": {
+      "main": [
+        [
+          {
+            "node": "Prepare Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Prompt": {
+      "main": [
+        [
+          {
+            "node": "Gemini API",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini API": {
+      "main": [
+        [
+          {
+            "node": "Callback API",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}
